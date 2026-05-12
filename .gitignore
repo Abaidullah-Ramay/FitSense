@@ -1,0 +1,7 @@
+.env
+chroma_db/
+temp_descriptions.txt
+__pycache__/
+*.pyc
+.DS_Store
+betterme-app/
