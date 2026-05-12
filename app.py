@@ -7,7 +7,7 @@ Overview
 A single-file Gradio application that recommends personalised fitness and meal
 plans from a CSV dataset using OpenAI embeddings and a Chroma vector store.
 No traditional ML (no sklearn, no collaborative filtering) — pure NLP similarity
-search followed by structured pandas filtering.
+search with Chroma metadata pre-filtering for guaranteed filter compliance.
 
 Pipeline (executed once at startup, then per query)
 ----------------------------------------------------
@@ -18,12 +18,11 @@ Startup:
      Semantic_Description column using text-embedding-3-small.
 
 Per query:
-  4. Embed the user's natural-language query and run similarity_search(k=20).
-  5. Extract Plan_IDs from the returned document text.
-  6. Filter the DataFrame to matched rows, honouring optional dropdowns
-     (Gender / Fitness Goal / Dietary Preference). Dropdown value "Any" skips
-     that filter entirely.
-  7. Return the top-3 rows as formatted text blocks in the Gradio UI.
+  4. Build a Chroma metadata filter from non-"Any" dropdown values.
+  5. Embed the query and run similarity_search(k=10, filter=...) within
+     the already-constrained subset — every result satisfies the filters.
+  6. Extract Plan_IDs from document metadata (no text parsing needed).
+  7. Slice the DataFrame to matched rows; return top-3 as Gradio text blocks.
 
 Inputs (Gradio UI)
 ------------------
@@ -54,21 +53,12 @@ Requirements
 # Standard library
 # ─────────────────────────────────────────────────────────────────────────────
 import os
-import re
-
-# Data handling — numpy is a project dependency (requirements.txt) reserved
-# for any numeric operations added in future; pandas drives all current logic.
 import numpy as np
 import pandas as pd
-
-# Environment variable loader — reads .env into os.environ
 from dotenv import load_dotenv
-
-# LangChain: vector store, document loader, embeddings, text splitter
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import TextLoader
+from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import CharacterTextSplitter
 
 # Gradio UI
 import gradio as gr
@@ -138,17 +128,17 @@ print(f"  {len(df)} plans ready.")
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Paths used by the vector DB pipeline.
-CHROMA_DIR = "chroma_db"          # persisted vector store lives here
-TEMP_FILE  = "temp_descriptions.txt"  # intermediate text file for TextLoader
+CHROMA_DIR = "chroma_db"  # persisted vector store lives here
 
 
 def initialize_vector_db(dataframe: pd.DataFrame) -> Chroma:
     """
-    Build a Chroma vector store from Semantic_Description, or load it from
-    disk if it was already built on a previous run.
+    Build a Chroma vector store from Semantic_Description with structured
+    metadata, or load it from disk if already built on a previous run.
 
-    Why persist? Embedding 1 000+ rows via the OpenAI API takes time and money.
-    On restart we skip re-embedding entirely by loading the saved collection.
+    Each document stores Gender, Fitness_Goal, and Dietary_Preference as
+    metadata so that similarity_search can pre-filter by those dimensions
+    before scoring — guaranteeing results always match the selected filters.
 
     Args:
         dataframe: The validated fitness-plans DataFrame from STEP 1.
@@ -157,13 +147,9 @@ def initialize_vector_db(dataframe: pd.DataFrame) -> Chroma:
         A LangChain Chroma object ready for similarity_search().
     """
 
-    # Create the embedding model once — used for both building and loading.
-    # text-embedding-3-small is fast, cheap, and accurate for this use case.
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-    # ── Check for an existing persisted DB ───────────────────────────────────
-    # os.listdir returns [] for an empty dir, so `and os.listdir(...)` guards
-    # against a leftover empty chroma_db/ folder triggering a false positive.
+    # ── Load existing DB if present ──────────────────────────────────────────
     if os.path.isdir(CHROMA_DIR) and os.listdir(CHROMA_DIR):
         print(f"Found existing Chroma DB at '{CHROMA_DIR}'. Loading from disk ...")
         vectordb = Chroma(
@@ -174,48 +160,30 @@ def initialize_vector_db(dataframe: pd.DataFrame) -> Chroma:
         print(f"  {count} documents loaded — skipping re-embedding.")
         return vectordb
 
-    # ── First run: write descriptions to a temp text file ────────────────────
-    # TextLoader expects a plain text file; one description per line lets
-    # CharacterTextSplitter treat each line as a single document chunk.
-    print(f"Writing {len(dataframe)} descriptions to '{TEMP_FILE}' ...")
-    with open(TEMP_FILE, "w", encoding="utf-8") as f:
-        for desc in dataframe["Semantic_Description"].astype(str):
-            # Flatten any embedded newlines so each row stays on one line.
-            f.write(desc.strip().replace("\n", " ") + "\n")
-
-    # ── Load the file with TextLoader ────────────────────────────────────────
-    # TextLoader reads the whole file as a single Document; splitting happens
-    # in the next step.
-    loader  = TextLoader(TEMP_FILE, encoding="utf-8")
-    raw_docs = loader.load()
-
-    # ── Split into one chunk per plan description ────────────────────────────
-    # chunk_size=500 is larger than the longest description (226 chars) so no
-    # line is ever split mid-text; splitting happens purely on the "\n" separator.
-    # chunk_overlap=0 → each plan is independent, no overlapping windows needed.
-    splitter = CharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=0,
-        separator="\n",
-    )
-    docs = splitter.split_documents(raw_docs)
-
-    print(f"  {len(dataframe)} dataset rows → {len(docs)} document chunks")
-    if len(docs) != len(dataframe):
-        # Mismatch means some descriptions contained literal newlines; the
-        # replace() above should prevent this, but flag it just in case.
-        print("  WARNING: chunk count != row count. Check Semantic_Description for newlines.")
+    # ── First run: build Document objects with structured metadata ───────────
+    # Structured columns are stored as metadata (not embedded into the vector).
+    # This lets Chroma filter by Gender / Fitness_Goal / Dietary_Preference
+    # before similarity scoring, so every returned doc satisfies the filters.
+    print(f"Building {len(dataframe)} documents with metadata ...")
+    docs = []
+    for _, row in dataframe.iterrows():
+        docs.append(Document(
+            page_content=str(row["Semantic_Description"]).strip().replace("\n", " "),
+            metadata={
+                "Plan_ID":            str(row["Plan_ID"]),
+                "Gender":             str(row.get("Gender", "")),
+                "Fitness_Goal":       str(row.get("Fitness_Goal", "")),
+                "Dietary_Preference": str(row.get("Dietary_Preference", "")),
+            },
+        ))
 
     # ── Embed and persist to Chroma ──────────────────────────────────────────
-    # Chroma.from_documents calls the OpenAI Embeddings API for every chunk,
-    # then writes the resulting vectors + metadata to CHROMA_DIR on disk.
     print("Embedding documents with OpenAI — this may take a moment ...")
     vectordb = Chroma.from_documents(
         documents=docs,
         embedding=embeddings,
         persist_directory=CHROMA_DIR,
     )
-
     count = vectordb._collection.count()
     print(f"  Done. {count} documents embedded and saved to '{CHROMA_DIR}'.")
     return vectordb
@@ -242,14 +210,13 @@ def get_recommendations(
     Retrieve the top fitness/meal plan recommendations for a natural-language query.
 
     Pipeline:
-      1. Embed the query and run semantic similarity search (top 20 candidates).
-      2. Extract Plan_IDs from the returned document text.
-      3. Slice df to those rows, preserving the similarity-ranked order.
-      4. Apply optional structured filters (gender / goal / diet).
+      1. Build a Chroma metadata filter from non-"Any" dropdown values.
+      2. Run similarity_search(k=10, filter=...) — Chroma pre-filters to the
+         matching demographic subset before ranking by cosine similarity.
+         Every returned document is guaranteed to satisfy the active filters.
+      3. Extract Plan_IDs from document metadata (no text parsing).
+      4. Slice df to those rows, preserving similarity-ranked order.
       5. Return up to 3 results as a list of plain dicts, or an error string.
-
-    Returning a string (not raising) on error keeps the Gradio UI alive — the
-    caller can check `isinstance(result, str)` to detect and display the message.
 
     Args:
         user_query:     Natural-language description of the user's fitness needs.
@@ -262,68 +229,72 @@ def get_recommendations(
     """
 
     # ── 1. Validate input ────────────────────────────────────────────────────
-    # Guard against empty submissions before touching the API.
     if not user_query or not user_query.strip():
         return "⚠️ Please enter a query describing your fitness needs."
 
-    # ── 2. Semantic similarity search ────────────────────────────────────────
-    # k=50 gives a large enough candidate pool so that after dietary/gender/goal
-    # filters are applied (each independently reduces results by ~50-75%), at
-    # least 3 plans survive. k=20 was too small when multiple filters combined.
+    # ── 2. Build Chroma metadata filter ─────────────────────────────────────
+    # Non-"Any" values are passed as a `where` clause to Chroma so the vector
+    # search operates only on the matching subset — no post-retrieval pruning.
+    # ChromaDB requires $and when filtering on more than one field simultaneously.
+    raw_filters: dict[str, str] = {}
+    if target_gender and target_gender != "Any":
+        raw_filters["Gender"] = target_gender
+    if target_goal and target_goal != "Any":
+        raw_filters["Fitness_Goal"] = target_goal
+    if target_diet and target_diet != "Any":
+        raw_filters["Dietary_Preference"] = target_diet
+
+    if not raw_filters:
+        where_clause = None
+    elif len(raw_filters) == 1:
+        key, val = next(iter(raw_filters.items()))
+        where_clause = {key: val}
+    else:
+        where_clause = {"$and": [{k: v} for k, v in raw_filters.items()]}
+
+    # ── 3. Semantic similarity search ────────────────────────────────────────
+    # k=10 is enough — Chroma pre-filters to the matching subset first, then
+    # returns the 10 most semantically similar docs within that subset.
     try:
-        similar_docs = vectordb.similarity_search(user_query.strip(), k=50)
+        similar_docs = vectordb.similarity_search(
+            user_query.strip(),
+            k=10,
+            filter=where_clause,
+        )
     except Exception as exc:
         return (
             f"❌ Vector search failed: {exc}\n"
             "Check your OPENAI_API_KEY and internet connection."
         )
 
-    # ── 3. Extract Plan_IDs from document text ───────────────────────────────
-    # Each document's page_content begins with its Plan_ID
-    # (e.g. "PLAN_042 This plan is designed for ...").
-    # We take the first whitespace-separated token and strip any stray
-    # punctuation that could prevent a match against df["Plan_ID"].
+    # ── 4. Extract Plan_IDs from document metadata ───────────────────────────
+    # Metadata is reliable — no regex parsing of page_content needed.
     retrieved_ids: list[str] = []
     for doc in similar_docs:
-        first_token = doc.page_content.strip().split()[0]
-        plan_id = re.sub(r"[^\w\-]", "", first_token)   # keep alphanum + _ + -
+        plan_id = doc.metadata.get("Plan_ID", "")
         if plan_id:
             retrieved_ids.append(plan_id)
 
     if not retrieved_ids:
         return (
-            "⚠️ Could not extract Plan IDs from search results.\n"
-            "Check that Semantic_Description values begin with the Plan_ID."
+            "⚠️ No matching plans found. "
+            "Try broadening your filters or rephrasing your query."
         )
 
-    # ── 4. Slice df to retrieved rows ────────────────────────────────────────
-    # Using pd.Categorical with retrieved_ids as categories preserves the
-    # similarity-ranked order returned by Chroma instead of the CSV row order.
+    # ── 5. Slice df and preserve Chroma's similarity rank order ─────────────
     filtered = df[df["Plan_ID"].isin(retrieved_ids)].copy()
     filtered["_rank"] = pd.Categorical(
         filtered["Plan_ID"], categories=retrieved_ids, ordered=True
     )
     filtered = filtered.sort_values("_rank").drop(columns="_rank")
 
-    # ── 5. Apply optional structured filters ────────────────────────────────
-    # "Any" means the user doesn't care about that dimension — skip the filter.
-    if target_gender and target_gender != "Any":
-        filtered = filtered[filtered["Gender"] == target_gender]
-
-    if target_goal and target_goal != "Any":
-        filtered = filtered[filtered["Fitness_Goal"] == target_goal]
-
-    if target_diet and target_diet != "Any":
-        filtered = filtered[filtered["Dietary_Preference"] == target_diet]
-
-    # ── 6. Handle zero results ───────────────────────────────────────────────
     if filtered.empty:
         return (
             "⚠️ No matching plans found. "
             "Try broadening your filters or rephrasing your query."
         )
 
-    # ── 7 & 8. Build and return the top-3 result list ────────────────────────
+    # ── 6. Build and return the top-3 result list ────────────────────────────
     results: list[dict] = []
     for _, row in filtered.head(3).iterrows():
         results.append({
