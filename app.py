@@ -309,131 +309,336 @@ def get_recommendations(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — GRADIO UI
+# STEP 4 — GRADIO DASHBOARD UI
 # ─────────────────────────────────────────────────────────────────────────────
+import re
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# Build dropdown choices dynamically from the dataset so they always reflect
-# whatever values are actually present in the CSV.
-GENDER_CHOICES = ["Any", "Male", "Female", "Non-binary"]
-GOAL_CHOICES   = ["Any"] + sorted(df["Fitness_Goal"].dropna().unique().tolist())
-# Exclude the dataset's own "Any" value to avoid a duplicate "Any" in the dropdown.
-# Plans with Dietary_Preference=="Any" in the CSV still appear when the user picks
-# "Any" from the UI (no filter applied), so they are never lost.
-DIET_CHOICES   = ["Any"] + sorted(
-    v for v in df["Dietary_Preference"].dropna().unique() if v != "Any"
-)
-
-DIVIDER = "─" * 45
+# ── Dropdown choices (form profiling) ────────────────────────────────────────
+AGE_CHOICES      = ["18-25", "26-35", "36-45", "46+"]
+GENDER_CHOICES   = ["Male", "Female", "Non-binary"]
+BMI_CHOICES      = ["Underweight", "Normal", "Overweight", "Obese"]
+ACTIVITY_CHOICES = ["Sedentary", "Light", "Moderate", "Active"]
+GOAL_CHOICES     = sorted(df["Fitness_Goal"].dropna().unique().tolist())
+DIET_CHOICES     = sorted(v for v in df["Dietary_Preference"].dropna().unique() if v != "Any")
 
 
-def format_plan(plan: dict) -> str:
-    """Format a single result dict into a human-readable block for a Textbox."""
-    return (
-        f"Plan ID: {plan['Plan_ID']}\n"
-        f"{DIVIDER}\n"
-        f"🏃 Exercise Schedule:\n{plan['Exercise_Schedule']}\n\n"
-        f"🥗 Meal Plan:\n{plan['Meal_Plan']}\n\n"
-        f"📊 Nutritional Facts:\n{plan['Nutritional_Facts']}\n\n"
-        f"🔥 Est. Calories Burned: {plan['Est_Calories_Burned']:,} kcal/week"
+# ── UI helper functions ───────────────────────────────────────────────────────
+
+def _parse_daily_kcal(nutritional_facts: str) -> int:
+    """Extract daily calorie intake from a Nutritional_Facts string."""
+    m = re.search(r"([\d,]+)\s*kcal", str(nutritional_facts))
+    return int(m.group(1).replace(",", "")) if m else 2000
+
+
+def _plan_card_html(plan: dict, rank: int) -> str:
+    """Render one plan as a styled HTML card."""
+    medals    = ["🥇", "🥈", "🥉"]
+    medal     = medals[rank] if rank < 3 else ""
+    daily_cal = _parse_daily_kcal(plan["Nutritional_Facts"])
+    return f"""
+<div class="fit-card">
+  <div class="fit-card-hdr">
+    <span class="fit-medal">{medal}</span>
+    <span class="fit-plan-id">{plan["Plan_ID"]}</span>
+    <span class="fit-cal-chip">🔥 {plan["Est_Calories_Burned"]:,} kcal / wk burned</span>
+  </div>
+  <div class="fit-sec fit-exercise">
+    <div class="fit-sec-lbl">🏃 Exercise Schedule</div>
+    <div class="fit-sec-body">{plan["Exercise_Schedule"]}</div>
+  </div>
+  <div class="fit-sec fit-meal">
+    <div class="fit-sec-lbl">🥗 Meal Plan</div>
+    <div class="fit-sec-body">{plan["Meal_Plan"]}</div>
+  </div>
+  <div class="fit-sec fit-nutrition">
+    <div class="fit-sec-lbl">📊 Nutritional Facts</div>
+    <div class="fit-sec-body">{plan["Nutritional_Facts"]}</div>
+    <div class="fit-intake-note">≈ {daily_cal:,} kcal / day &nbsp;·&nbsp; {daily_cal * 7:,} kcal / week food intake</div>
+  </div>
+</div>"""
+
+
+def _build_chart(plans: list[dict]) -> plt.Figure:
+    """Grouped bar chart: calories burned (workout) vs consumed (food) per plan."""
+    labels   = [p["Plan_ID"] for p in plans]
+    burned   = [p["Est_Calories_Burned"] for p in plans]
+    consumed = [_parse_daily_kcal(p["Nutritional_Facts"]) * 7 for p in plans]
+
+    n, w = len(labels), 0.35
+    x    = list(range(n))
+
+    fig, ax = plt.subplots(figsize=(max(6, n * 3.5), 5))
+    fig.patch.set_facecolor("#1e293b")
+    ax.set_facecolor("#0f172a")
+
+    b1 = ax.bar([i - w / 2 for i in x], burned,   w, color="#ef4444", label="🔥 Burned  (workout)", zorder=3)
+    b2 = ax.bar([i + w / 2 for i in x], consumed, w, color="#3b82f6", label="🍽️  Consumed (food)",   zorder=3)
+
+    for bar in list(b1) + list(b2):
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2, h + 50, f"{int(h):,}",
+                ha="center", va="bottom", color="white", fontsize=9, fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, color="#e2e8f0", fontsize=10)
+    ax.set_ylabel("kcal / week", color="#94a3b8", fontsize=10)
+    ax.set_title("Weekly Calorie Balance — Burned vs. Consumed", color="#f1f5f9", fontsize=13, pad=14)
+    ax.tick_params(colors="#94a3b8")
+    for spine in ax.spines.values():
+        spine.set_color("#334155")
+    ax.yaxis.grid(True, color="#334155", linestyle="--", alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    ax.legend(facecolor="#1e293b", edgecolor="#334155", labelcolor="#e2e8f0", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+# ── Event handlers ────────────────────────────────────────────────────────────
+
+def on_submit(name, age, gender, bmi, goal, activity, diet, query):
+    """Form submit: run recommendation, switch to dashboard view."""
+    # Auto-build query from profile if the user left the text box blank
+    effective_q = (query or "").strip() or (
+        f"{goal or ''} {diet or ''} plan for a {bmi or 'normal'} "
+        f"{activity or 'moderate'} {gender or 'person'} aged {age or ''}".strip()
     )
+    results = get_recommendations(effective_q, gender or "Any", goal or "Any", diet or "Any")
 
-
-def run_search(
-    query: str,
-    gender: str,
-    goal: str,
-    diet: str,
-) -> tuple[str, str, str]:
-    """
-    Gradio event handler — bridges the UI and get_recommendations().
-
-    Calls get_recommendations, formats each result dict into a display string,
-    and pads missing slots to always return exactly 3 strings (one per output
-    Textbox). Error strings from get_recommendations go into Plan 1; the other
-    two boxes are left blank so the UI doesn't show stale content.
-
-    Args:
-        query:  Raw text from the query Textbox.
-        gender: Selected value from the Gender dropdown.
-        goal:   Selected value from the Fitness Goal dropdown.
-        diet:   Selected value from the Dietary Preference dropdown.
-
-    Returns:
-        A 3-tuple of strings (plan1_text, plan2_text, plan3_text).
-    """
-    results = get_recommendations(query, gender, goal, diet)
-
-    # get_recommendations returns a string on any error or warning condition.
     if isinstance(results, str):
-        return results, "", ""
-
-    # Format each plan dict and pad to exactly 3 entries.
-    formatted = [format_plan(r) for r in results]
-    while len(formatted) < 3:
-        formatted.append("No additional plans found.")
-
-    return formatted[0], formatted[1], formatted[2]
-
-
-# ── Build the interface ───────────────────────────────────────────────────────
-with gr.Blocks(title="Semantic Fitness Recommender") as demo:
-
-    # Header
-    gr.Markdown("# 🏋️ Semantic Fitness & Meal Plan Recommender")
-    gr.Markdown(
-        "Describe your fitness situation in plain English and get AI-matched plans."
-    )
-
-    # Query input
-    with gr.Row():
-        query_box = gr.Textbox(
-            label="Your Query",
-            placeholder=(
-                "e.g. I want a safe low-impact workout for someone with bad knees "
-                "and a vegan diet"
-            ),
-            lines=3,
+        # Stay on form, surface error message
+        return (
+            gr.update(visible=True), gr.update(visible=False), [],
+            "", "", "", "",
+            gr.update(choices=[], value=[]),
+            gr.update(visible=False),
+            f'<p class="fit-error">{results}</p>',
         )
 
-    # Filter dropdowns — side by side
-    with gr.Row():
-        gender_dd = gr.Dropdown(
-            choices=GENDER_CHOICES,
-            value="Any",
-            label="Gender",
-        )
-        goal_dd = gr.Dropdown(
-            choices=GOAL_CHOICES,
-            value="Any",
-            label="Fitness Goal",
-        )
-        diet_dd = gr.Dropdown(
-            choices=DIET_CHOICES,
-            value="Any",
-            label="Dietary Preference",
-        )
+    user     = (name or "").strip() or "there"
+    goal_txt = goal if goal else "your goal"
+    diet_txt = f" · {diet}" if diet else ""
+    choices  = [f"{['🥇','🥈','🥉'][i]} {r['Plan_ID']}" for i, r in enumerate(results)]
 
-    # Search trigger
-    search_btn = gr.Button("🔍 Find My Plans", variant="primary")
+    welcome = f"""
+<div class="fit-welcome">
+  <h2>Welcome, {user}! 👋</h2>
+  <p>Top <strong>{len(results)}</strong> plans matched for <em>{goal_txt}</em>{diet_txt}</p>
+</div>"""
 
-    gr.Markdown("---")
-    gr.Markdown("## 🥇 Top Recommendations")
+    cards = [_plan_card_html(r, i) for i, r in enumerate(results)]
+    while len(cards) < 3:
+        cards.append('<div class="fit-card fit-card-empty"><p>No additional plan found.</p></div>')
 
-    # One output box per recommendation slot
-    with gr.Row():
-        out1 = gr.Textbox(label="Plan 1", lines=10, interactive=False)
-        out2 = gr.Textbox(label="Plan 2", lines=10, interactive=False)
-        out3 = gr.Textbox(label="Plan 3", lines=10, interactive=False)
-
-    # Wire button → wrapper → output boxes
-    search_btn.click(
-        fn=run_search,
-        inputs=[query_box, gender_dd, goal_dd, diet_dd],
-        outputs=[out1, out2, out3],
+    return (
+        gr.update(visible=False), gr.update(visible=True), results,
+        welcome, cards[0], cards[1], cards[2],
+        gr.update(choices=choices, value=[]),
+        gr.update(visible=False),
+        "",
     )
 
 
-# ── Launch ────────────────────────────────────────────────────────────────────
+def on_chart_change(selected, plans_data):
+    """Checkbox change: regenerate the calorie comparison chart."""
+    if not selected or not plans_data:
+        return gr.update(visible=False), None
+    lookup = {p["Plan_ID"]: p for p in plans_data}
+    chosen = [lookup[lbl.split(" ", 1)[-1]] for lbl in selected if lbl.split(" ", 1)[-1] in lookup]
+    if not chosen:
+        return gr.update(visible=False), None
+    return gr.update(visible=True), _build_chart(chosen)
+
+
+def on_back():
+    """Back button: return to profile form."""
+    return (
+        gr.update(visible=True), gr.update(visible=False), [],
+        "", "", "", "",
+        gr.update(choices=[], value=[]),
+        gr.update(visible=False),
+        "",
+    )
+
+
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+CSS = """
+.gradio-container { max-width:1280px !important; margin:0 auto !important;
+    font-family:'Inter',system-ui,sans-serif !important; }
+
+/* ── Brand ── */
+.fit-brand { text-align:center; padding:44px 16px 28px; }
+.fit-brand h1 { font-size:2.8rem; font-weight:800; margin-bottom:8px;
+    background:linear-gradient(90deg,#6366f1,#38bdf8);
+    -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.fit-brand p { color:#94a3b8; font-size:1.05rem; }
+
+/* ── Form card ── */
+#form-card { background:rgba(30,41,59,.88) !important;
+    border:1px solid rgba(99,102,241,.28) !important;
+    border-radius:20px !important; padding:32px !important;
+    max-width:880px; margin:0 auto;
+    box-shadow:0 24px 56px rgba(0,0,0,.5) !important; }
+
+/* ── Buttons ── */
+#submit-btn { background:linear-gradient(135deg,#6366f1,#3b82f6) !important;
+    border:none !important; border-radius:12px !important;
+    font-size:1rem !important; font-weight:700 !important;
+    width:100% !important; margin-top:14px !important;
+    box-shadow:0 4px 18px rgba(99,102,241,.4) !important;
+    transition:all .2s !important; }
+#submit-btn:hover { transform:translateY(-2px) !important;
+    box-shadow:0 8px 28px rgba(99,102,241,.55) !important; }
+#back-btn { background:rgba(30,41,59,.7) !important;
+    border:1px solid rgba(148,163,184,.25) !important;
+    color:#94a3b8 !important; border-radius:8px !important; font-size:.85rem !important; }
+
+/* ── Dashboard ── */
+#dashboard-wrap { padding:20px 4px !important; }
+
+/* ── Welcome strip ── */
+.fit-welcome { padding:4px 0 18px; }
+.fit-welcome h2 { font-size:1.75rem; font-weight:700; color:#f1f5f9; margin-bottom:4px; }
+.fit-welcome p  { color:#94a3b8; font-size:.95rem; }
+
+/* ── Section headings ── */
+.fit-heading { font-size:1.15rem; font-weight:700; color:#e2e8f0;
+    margin:28px 0 10px; padding-bottom:8px;
+    border-bottom:1px solid rgba(99,102,241,.3); }
+.fit-hint { color:#64748b; font-size:.85rem; margin:0 0 10px; }
+
+/* ── Plan cards ── */
+.fit-card { background:rgba(15,23,42,.92) !important;
+    border:1px solid rgba(99,102,241,.2) !important;
+    border-radius:16px !important; overflow:hidden !important;
+    transition:transform .2s,box-shadow .2s; height:100%; }
+.fit-card:hover { transform:translateY(-4px);
+    box-shadow:0 14px 36px rgba(99,102,241,.28); }
+
+.fit-card-hdr { display:flex; align-items:center; gap:10px; padding:14px 18px;
+    background:rgba(99,102,241,.1); border-bottom:1px solid rgba(99,102,241,.18); }
+.fit-medal  { font-size:1.4rem; }
+.fit-plan-id { font-size:.9rem; font-weight:700; color:#a5b4fc;
+    flex:1; letter-spacing:.05em; }
+.fit-cal-chip { font-size:.72rem; font-weight:600;
+    background:rgba(239,68,68,.15); color:#fca5a5;
+    border:1px solid rgba(239,68,68,.28); border-radius:20px;
+    padding:3px 10px; white-space:nowrap; }
+
+.fit-sec { padding:13px 18px; border-bottom:1px solid rgba(255,255,255,.05); }
+.fit-sec:last-child { border-bottom:none; }
+.fit-sec-lbl { font-size:.7rem; font-weight:700; letter-spacing:.08em;
+    text-transform:uppercase; margin-bottom:7px; }
+.fit-exercise .fit-sec-lbl { color:#34d399; }
+.fit-meal     .fit-sec-lbl { color:#fbbf24; }
+.fit-nutrition .fit-sec-lbl { color:#a78bfa; }
+.fit-sec-body { font-size:.84rem; color:#cbd5e1; line-height:1.7; }
+.fit-intake-note { margin-top:7px; font-size:.74rem; color:#a78bfa; font-weight:600; }
+.fit-card-empty { display:flex; align-items:center; justify-content:center;
+    min-height:200px; color:#475569; font-size:.9rem; }
+
+/* ── Checkbox group ── */
+#plan-selector { background:rgba(15,23,42,.65) !important;
+    border:1px solid rgba(99,102,241,.22) !important;
+    border-radius:12px !important; padding:16px 20px !important; margin:6px 0 !important; }
+
+/* ── Chart wrapper ── */
+#chart-wrap { background:rgba(15,23,42,.75) !important;
+    border:1px solid rgba(99,102,241,.18) !important;
+    border-radius:16px !important; padding:20px !important; margin-top:8px !important; }
+
+/* ── Error ── */
+.fit-error { background:rgba(239,68,68,.1); border:1px solid rgba(239,68,68,.3);
+    color:#fca5a5; border-radius:8px; padding:10px 14px;
+    font-size:.875rem; margin:8px 0; }
+"""
+
+# ── Layout ────────────────────────────────────────────────────────────────────
+with gr.Blocks(css=CSS, title="FitSense") as demo:
+
+    plans_state = gr.State([])
+
+    # ══════════════════════════════════════════
+    # SCREEN 1 — USER PROFILE FORM
+    # ══════════════════════════════════════════
+    with gr.Column(visible=True, elem_id="form-wrap") as form_col:
+
+        gr.HTML("""
+<div class="fit-brand">
+  <h1>🏋️ FitSense</h1>
+  <p>Complete your fitness profile and we'll match the perfect plan for you.</p>
+</div>""")
+
+        with gr.Group(elem_id="form-card"):
+            name_inp = gr.Textbox(label="Your Name", placeholder="e.g. Alex")
+            with gr.Row():
+                age_dd      = gr.Dropdown(AGE_CHOICES,      label="Age Group",          value=None)
+                gender_dd   = gr.Dropdown(GENDER_CHOICES,   label="Gender",             value=None)
+                bmi_dd      = gr.Dropdown(BMI_CHOICES,      label="BMI Category",       value=None)
+            with gr.Row():
+                goal_dd     = gr.Dropdown(GOAL_CHOICES,     label="Fitness Goal",       value=None)
+                activity_dd = gr.Dropdown(ACTIVITY_CHOICES, label="Activity Level",     value=None)
+                diet_dd     = gr.Dropdown(DIET_CHOICES,     label="Dietary Preference", value=None)
+            query_box = gr.Textbox(
+                label="Describe your needs in your own words (optional)",
+                placeholder='"e.g. low-impact cardio for bad knees, prefer morning sessions"',
+                lines=2,
+            )
+            error_html = gr.HTML("")
+            submit_btn = gr.Button("Find My Plans →", variant="primary", elem_id="submit-btn")
+
+    # ══════════════════════════════════════════
+    # SCREEN 2 — RECOMMENDATIONS DASHBOARD
+    # ══════════════════════════════════════════
+    with gr.Column(visible=False, elem_id="dashboard-wrap") as dashboard_col:
+
+        with gr.Row():
+            welcome_html = gr.HTML("", scale=5)
+            back_btn     = gr.Button("← New Search", scale=1, size="sm", elem_id="back-btn")
+
+        gr.HTML('<div class="fit-heading">🏆 Your Recommended Plans</div>')
+
+        with gr.Row(equal_height=True):
+            plan1_html = gr.HTML("")
+            plan2_html = gr.HTML("")
+            plan3_html = gr.HTML("")
+
+        gr.HTML('<div class="fit-heading">📊 Calorie Comparison</div>')
+        gr.HTML('<p class="fit-hint">Tick a plan to see its weekly calories burned vs. food intake side-by-side.</p>')
+
+        plan_selector = gr.CheckboxGroup(
+            choices=[], value=[], label="", elem_id="plan-selector",
+        )
+
+        with gr.Column(visible=False, elem_id="chart-wrap") as chart_col:
+            chart_plot = gr.Plot(show_label=False)
+
+    # ── Event wiring ──────────────────────────────────────────────────────────
+    _submit_outputs = [
+        form_col, dashboard_col, plans_state,
+        welcome_html, plan1_html, plan2_html, plan3_html,
+        plan_selector, chart_col, error_html,
+    ]
+
+    submit_btn.click(
+        fn=on_submit,
+        inputs=[name_inp, age_dd, gender_dd, bmi_dd, goal_dd, activity_dd, diet_dd, query_box],
+        outputs=_submit_outputs,
+    )
+
+    plan_selector.change(
+        fn=on_chart_change,
+        inputs=[plan_selector, plans_state],
+        outputs=[chart_col, chart_plot],
+    )
+
+    back_btn.click(
+        fn=on_back,
+        outputs=_submit_outputs,
+    )
+
+
 if __name__ == "__main__":
-    # theme moved to launch() in Gradio 6.0
     demo.launch(theme=gr.themes.Glass())

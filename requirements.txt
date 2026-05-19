@@ -1,6 +1,7 @@
 python-dotenv
 pandas
 numpy
+matplotlib
 langchain-community
 langchain-openai
 langchain-chroma
