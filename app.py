@@ -556,7 +556,7 @@ CSS = """
 """
 
 # ── Layout ────────────────────────────────────────────────────────────────────
-with gr.Blocks(css=CSS, title="FitSense") as demo:
+with gr.Blocks(title="FitSense") as demo:
 
     plans_state = gr.State([])
 
@@ -641,4 +641,4 @@ with gr.Blocks(css=CSS, title="FitSense") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(theme=gr.themes.Glass())
+    demo.launch(theme=gr.themes.Glass(), css=CSS)
